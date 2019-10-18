@@ -1,10 +1,11 @@
-{application, chatdemo,
+{application, chatdemo_client,
  [{description, "An escript"},
   {vsn, "0.1.0"},
   {registered, []},
   {applications,
    [kernel,
-    stdlib
+    stdlib,
+    gun
    ]},
   {env,[]},
   {modules, []},

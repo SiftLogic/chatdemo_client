@@ -1,7 +1,15 @@
 {"1.1.0",
-[{<<"cowlib">>,{pkg,<<"cowlib">>,<<"2.6.0">>},1},
+[{<<"cowboy">>,
+  {git,"git://github.com/extend/cowboy.git",
+       {ref,"d846827b2a70317914621328bd617e4e5d4d13d8"}},
+  0},
+ {<<"cowlib">>,{pkg,<<"cowlib">>,<<"2.6.0">>},1},
  {<<"gun">>,{pkg,<<"gun">>,<<"1.3.1">>},0},
- {<<"mochiweb">>,{pkg,<<"mochiweb">>,<<"2.18.0">>},0}]}.
+ {<<"mochiweb">>,{pkg,<<"mochiweb">>,<<"2.18.0">>},0},
+ {<<"ranch">>,
+  {git,"git://github.com/extend/ranch.git",
+       {ref,"3190aef88aea04d6dce8545fe9b4574288903f44"}},
+  0}]}.
 [
 {pkg_hash,[
  {<<"cowlib">>, <<"8AA629F81A0FC189F261DC98A42243FA842625FEEA3C7EC56C48F4CCDB55490F">>},

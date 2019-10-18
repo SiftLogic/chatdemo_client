@@ -3,6 +3,7 @@
 -behaviour(gen_server).
 
 %% API
+-export([start/2]).
 -export([start_link/2]).
 
 -export([set_username/1,
@@ -46,6 +47,11 @@ send_user(User, Message) ->
 start_link(Ip, Apikey) ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [Ip, Apikey], []).
 
+-spec(start(term(), term()) ->
+    {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
+start(Ip, Apikey) ->
+    gen_server:start({local, ?SERVER}, ?MODULE, [Ip, Apikey], []).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -66,8 +72,12 @@ start_link(Ip, Apikey) ->
              {stop, Reason :: term()} | ignore).
 init([IpAddress, Apikey]) ->
     {ok, Ip} = convert_ip(IpAddress),
-    {ok, {MRef, ConnPid, StreamRef}} = connect(Ip, Apikey),
-    {ok, #state{conn = ConnPid, ref = MRef, stream = StreamRef, apikey = Apikey, ip = Ip}}.
+    case connect(Ip, Apikey) of
+        {ok, {MRef, ConnPid, StreamRef}} ->
+            {ok, #state{conn = ConnPid, ref = MRef, stream = StreamRef, apikey = Apikey, ip = Ip}};
+        Error ->
+            {stop, Error}
+    end.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -135,13 +145,8 @@ handle_cast(_Request, State) ->
              {noreply, NewState :: #state{}} |
              {noreply, NewState :: #state{}, timeout() | hibernate} |
              {stop, Reason :: term(), NewState :: #state{}}).
-handle_info({gun_down, Pid, _Proto, normal, _Refs0, _Refs1}, #state{conn = Pid, ref = Ref, ip = Ip, apikey = ApiKey} = State) ->
-    io:format("Connection ~p down, reconnecting~n", [Pid]),
-    erlang:demonitor(Ref),
-    {ok, {NRef, NPid, NStream}} = connect(Ip, ApiKey),
-    {noreply, State#state{conn = NPid, ref = NRef, stream = NStream}};
-handle_info({gun_ws, _ConnPid, _StreamRef, Frame}, State) ->
-    Body = mochijson2:decode(Frame),
+handle_info({gun_ws, _ConnPid, _StreamRef, {text, Frame}}, State) ->
+    Body = mochijson2:decode(Frame, [{format, proplist}]),
     From = proplists:get_value(<<"from">>, Body, <<"anonymous">>),
     Msg = proplists:get_value(<<"msg">>, Body, <<"hmmm: empty message">>),
     Private = proplists:get_value(<<"private">>, Body, false),
@@ -152,7 +157,13 @@ handle_info({gun_ws, _ConnPid, _StreamRef, Frame}, State) ->
             io:format("~s says: ~s~n", [From, Msg])
     end,
     {noreply, State};
+handle_info({gun_down, Pid, _Proto, _Reason, _Refs0, _Refs1}, #state{conn = Pid, ref = Ref, ip = Ip, apikey = ApiKey} = State) ->
+    io:format("Connection ~p down, reconnecting~n", [Pid]),
+    erlang:demonitor(Ref),
+    {ok, {NRef, NPid, NStream}} = connect(Ip, ApiKey),
+    {noreply, State#state{conn = NPid, ref = NRef, stream = NStream}};
 handle_info(_Info, State) ->
+    io:format("Received unmatched message: ~p ~n", [_Info]),
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -200,10 +211,10 @@ convert_ip(IpAddress) ->
 connect(Ip, Apikey) ->
     Opts = #{retry => 0},
     io:format("connecting to ~p~n", [Ip]),
-    case gun:open(Ip, ?SERVER_PORT, Opts) of
+    case gun:open(inet_parse:ntoa(Ip), ?SERVER_PORT, Opts) of
         {ok, ConnPid} ->
             case gun:await_up(ConnPid) of
-                {ok, http} ->
+                {ok, _Proto} ->
                     MRef = monitor(process, ConnPid),
                     %% Now we upgrade to websocket
                     Headers = [{<<"x-apikey">>, Apikey}],

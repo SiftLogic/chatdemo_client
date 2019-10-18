@@ -4,7 +4,7 @@ chatdemo
 An demo escript for a chat client
 
 Requires:
-- Erlang 21: https://www.erlang-solutions.com/resources/download.html
+- Erlang 20: https://www.erlang-solutions.com/resources/download.html
 - rebar3: https://rebar3.org
 
 
@@ -16,4 +16,4 @@ Build
 Run
 ---
 
-    $ _build/default/bin/chatdemo
+    $ _build/default/bin/chatdemo_client
