@@ -40,33 +40,107 @@ args() ->
 usage() ->
     io:format("Commands:~n"
               "+++++++++~n"
-              "/q - Exit~n"
-              "/u USERNAME - set your username~n"
-              "/USERNAME MESSAGE - send a message to a specific USERNAME~n"
+              "/help or /h - Help~n"
+              "/quit or /q - Exit~n"
+              "/register USERNAME PASSWORD - register your username/password~n"
+              "/login USERNAME PASSWORD - Login~n"
+              "/password OLDPASSWORD NEWPASSWORD - Change your password~n"
+              "/channels - List all channels you're a member of~n"
+              "/users - List all users~n"
+              "/channel list - List all channels~n"
+              "/channel create CHANNEL ACCESS - Register a new channel. ACCESS can be private or public.~n"
+              "/channel join CHANNEL - Join a channel~n"
+              "/channel leave CHANNEL - Leave a channel~n"
+              "/channel members CHANNEL - List all members of a channel~n"
+              "/channel delete CHANNEL - Delete the channel. Channel owner only~n"
+              "/channel adduser CHANNEL USERNAME ROLE - Add a user to a private channel. Channel owner only. ROLE can be admin or member.~n"
+              "/channel kickuser CHANNEL USERNAME - Kick a user off a private channel. Channel owner only~n"
+              "/channel CHANNEL MESSAGE - Send a message to a channel~n"
+              "/whisper USERNAME MESSAGE - send a private message to a specific USERNAME~n"
               "MESSAGE - broadcast a message to all users~n").
 
 loop() ->
-    case io:get_line(">") of
-        "/q\n" ->
+    Input = io:get_line(">"),
+    case to_cmd(Input) of
+        quit ->
             quit;
-        "/h\n" ->
+        help ->
             usage(),
             loop();
-        Data0 ->
-            Data1 = re:replace(Data0, "(^\\s+)|(\\s+$)", "", [global, {return, binary}]),
-            case handle_command(Data1) of
-                ok ->
-                    ok;
-                {error, Msg} ->
-                    io:format("Error: ~s~n", [Msg])
-            end,
+        {error, Err} ->
+            io:format("ERROR: ~s~n", [Err]),
+            loop();
+        {_, _, _} = Command ->
+            ok = chatdemo_conn:handle_command(Command),
             loop()
     end.
 
-handle_command(<<"/u ", Username/binary>>) ->
-    chatdemo_conn:set_username(Username);
-handle_command(<<"/", Rest/binary>>) ->
+-spec to_cmd(list() | binary()) -> atom() | {atom(), atom() | binary(), atom() | binary()}.
+to_cmd(Cmd0) when is_list(Cmd0) ->
+    %% Trim leading/trailing spaces
+    Cmd1 = re:replace(Cmd0, "(^\\s+)|(\\s+$)", "", [global, {return, binary}]),
+    %% Remove linefeed chars
+    Cmd = binary:replace(Cmd1, [<<"\r">>,<<"\n">>], <<>>, [global]),
+    to_cmd(Cmd);
+to_cmd(Quit) when Quit =:= <<"/q">> orelse Quit =:= <<"/quit">> ->
+    quit;
+to_cmd(Help) when Help =:= <<"/h">> orelse Help =:= <<"/help">> ->
+    help;
+to_cmd(<<"/register ", UserPass/binary>>) ->
+    [Username, Password] = binary:split(UserPass, <<" ">>),
+    {user, register, {Username, Password}};
+to_cmd(<<"/login ", UserPass/binary>>) ->
+    [Username, Password] = binary:split(UserPass, <<" ">>),
+    {user, login, {Username, Password}};
+to_cmd(<<"/password ", OldNew/binary>>) ->
+    [Old, New] = binary:split(OldNew, <<" ">>),
+    {user, password, {Old, New}};
+to_cmd(<<"/users">>) ->
+    {user, list, undefined};
+to_cmd(<<"/channels">>) ->
+    {user, channels, undefined};
+to_cmd(<<"/channel list">>) ->
+    {channel, list, undefined};
+to_cmd(<<"/channel create ", ChannelAccess/binary>>) ->
+    {Channel, Access} = case binary:split(ChannelAccess, <<" ">>) of
+                            [Channel0] ->
+                                {Channel0, <<"public">>};
+                            [Channel0, Access0] ->
+                                {Channel0, Access0}
+                        end,
+    {channel, create, {Channel, Access}};
+to_cmd(<<"/channel delete ", Channel/binary>>) ->
+    {channel, delete, Channel};
+to_cmd(<<"/channel join ", Channel/binary>>) ->
+    {channel, join, Channel};
+to_cmd(<<"/channel leave ", Channel/binary>>) ->
+    {channel, leave, Channel};
+to_cmd(<<"/channel members ", Channel/binary>>) ->
+    {channel, members, Channel};
+to_cmd(<<"/channel adduser ", ChannelUserRole/binary>>) ->
+    %% not documented in help
+    {Channel, User, Role} =
+        case binary:split(ChannelUserRole, <<" ">>, [global]) of
+            [_Channel0] ->
+                {error, <<"Usage is /channel adduser USERNAME ROLE">>};
+            [Channel0, User0] ->
+                {Channel0, User0, <<"user">>};
+            [Channel0, User0, Role0]
+              when Role0 =:= <<"member">> orelse
+                   Role0 =:= <<"admin">> ->
+                {Channel0, User0, Role0}
+        end,
+    {channel, adduser, {Channel, User, Role}};
+to_cmd(<<"/channel kickuser ", ChannelUser/binary>>) ->
+    [Channel, User] = binary:split(ChannelUser, <<" ">>),
+    {channel, kickuser, {Channel, User}};
+to_cmd(<<"/channel ", Rest/binary>>) ->
+    [Channel, Message] = binary:split(Rest, <<" ">>),
+    {channel, message, {Channel, Message}};
+to_cmd(<<"/whisper ", Rest/binary>>) ->
     [User | Message] = binary:split(Rest, <<" ">>),
-    chatdemo_conn:send_user(User, Message);
-handle_command(Message) ->
-    chatdemo_conn:send_global(Message).
+    {msg, User, Message};
+to_cmd(<<"/", _/binary>>) ->
+    {error, <<"Unknown command. See '/help'">>};
+to_cmd(Message) ->
+    {msg, global, Message}.
