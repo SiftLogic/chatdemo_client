@@ -18,9 +18,8 @@ main(Help) when Help =:= ["-h"] orelse Help =:= ["--help"] ->
     erlang:halt(0);
 main([ServerIpAddress]) ->
     application:ensure_all_started(gun),
-    try chatdemo_conn:start(ServerIpAddress, ?APIKEY) of
-        {ok, Pid} ->
-            erlang:link(Pid),
+    try chatdemo_conn_sup:start_link([ServerIpAddress, ?APIKEY]) of
+        {ok, _Pid} ->
             quit = loop();
         Error ->
             io:format("Error connecting: ~p~n", [Error])
@@ -38,30 +37,42 @@ args() ->
               "EG: _build/default/bin/chatdemo_client 127.0.0.1~n~n").
 
 usage() ->
-    io:format("Commands:~n"
-              "+++++++++~n"
-              "/help or /h - Help~n"
-              "/quit or /q - Exit~n"
-              "/register USERNAME PASSWORD - register your username/password~n"
-              "/login USERNAME PASSWORD - Login~n"
-              "/password OLDPASSWORD NEWPASSWORD - Change your password~n"
-              "/channels - List all channels you're a member of~n"
-              "/users - List all users~n"
-              "/channel list - List all channels~n"
-              "/channel create CHANNEL ACCESS - Register a new channel. ACCESS can be private or public.~n"
-              "/channel join CHANNEL - Join a channel~n"
-              "/channel leave CHANNEL - Leave a channel~n"
-              "/channel members CHANNEL - List all members of a channel~n"
-              "/channel delete CHANNEL - Delete the channel. Channel owner only~n"
-              "/channel adduser CHANNEL USERNAME ROLE - Add a user to a private channel. Channel owner only. ROLE can be admin or member.~n"
-              "/channel kickuser CHANNEL USERNAME - Kick a user off a private channel. Channel owner only~n"
-              "/channel CHANNEL MESSAGE - Send a message to a channel~n"
-              "/whisper USERNAME MESSAGE - send a private message to a specific USERNAME~n"
-              "MESSAGE - broadcast a message to all users~n").
+    io:format(
+      "Commands:~n"
+      "+++++++++~n"
+      "/help or /h - Help~n"
+      "/quit or /q - Exit~n"
+      "/connect - Reconnect to the server~n"
+      "/register USERNAME PASSWORD - register your username/password~n"
+      "/login USERNAME PASSWORD - Login~n"
+      "/logoff - Logoff and disconnect~n"
+      "/password OLDPASSWORD NEWPASSWORD - Change your password~n"
+      "/channels - List all channels you're a member of~n"
+      "/users - List all users~n"
+      "/channel list - List all channels~n"
+      "/channel create CHANNEL ACCESS - Register a new channel. ACCESS can be private or public.~n"
+      "/channel join CHANNEL - Join a channel~n"
+      "/channel leave CHANNEL - Leave a channel~n"
+      "/channel members CHANNEL - List all members of a channel~n"
+      "/channel delete CHANNEL - Delete the channel. Channel owner only~n"
+      "/channel adduser CHANNEL USERNAME ROLE - Add a user to a private channel."
+      " Channel owner only. ROLE can be admin or member.~n"
+      "/channel kickuser CHANNEL USERNAME - Kick a user off a private channel. Channel owner only~n"
+      "/channel CHANNEL MESSAGE - Send a message to a channel~n"
+      "/whisper USERNAME MESSAGE - send a private message to a specific USERNAME~n"
+      "MESSAGE - broadcast a message to all users~n").
 
 loop() ->
+    %% Blocking command waiting for user input. Returns when LF or CRLF received
     Input = io:get_line(">"),
+    %% Converted the received line into a command or message
     case to_cmd(Input) of
+        conn_kill ->
+            exit(whereis(chatdemo_conn), kill),
+            loop();
+        sup_kill ->
+            exit(whereis(chatdemo_conn_sup), kill),
+            loop();
         quit ->
             quit;
         help ->
@@ -71,6 +82,7 @@ loop() ->
             io:format("ERROR: ~s~n", [Err]),
             loop();
         {_, _, _} = Command ->
+            %% Dispatch command to the chatdemo_conn process for handling
             ok = chatdemo_conn:handle_command(Command),
             loop()
     end.
@@ -82,16 +94,27 @@ to_cmd(Cmd0) when is_list(Cmd0) ->
     %% Remove linefeed chars
     Cmd = binary:replace(Cmd1, [<<"\r">>,<<"\n">>], <<>>, [global]),
     to_cmd(Cmd);
+to_cmd(<<"/conn-kill">>) ->
+    conn_kill;
+to_cmd(<<"/sup-kill">>) ->
+    sup_kill;
 to_cmd(Quit) when Quit =:= <<"/q">> orelse Quit =:= <<"/quit">> ->
     quit;
 to_cmd(Help) when Help =:= <<"/h">> orelse Help =:= <<"/help">> ->
     help;
+to_cmd(<<"/connect">>) ->
+    {network, connect, undefined};
+to_cmd(<<"/connect ", IpAddress0/binary>>) ->
+    {ok, Ip} = inet_parse:address(binary_to_list(IpAddress0)),
+    {network, connect, Ip};
 to_cmd(<<"/register ", UserPass/binary>>) ->
     [Username, Password] = binary:split(UserPass, <<" ">>),
     {user, register, {Username, Password}};
 to_cmd(<<"/login ", UserPass/binary>>) ->
     [Username, Password] = binary:split(UserPass, <<" ">>),
     {user, login, {Username, Password}};
+to_cmd(<<"/logoff">>) ->
+    {user, logoff, undefined};
 to_cmd(<<"/password ", OldNew/binary>>) ->
     [Old, New] = binary:split(OldNew, <<" ">>),
     {user, password, {Old, New}};

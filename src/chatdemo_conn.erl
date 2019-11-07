@@ -20,11 +20,27 @@
 -define(SERVER_PORT, 8181).
 -define(BASE_PATH, "/chat").
 
--record(state, {conn, ref, stream, apikey, ip, status = <<"not_logged_on">>, user, pass}).
+-define(DISCONNECTED, <<"disconnected">>).
+-define(NOT_LOGGED_ON, <<"not_logged_on">>).
+
+%% Records are 'syntactic sugar'. They are converted into tuples during compilation
+-record(state,
+        {
+         conn                   :: undefined | port(),
+         ref                    :: undefined | reference(),
+         stream                 :: undefined | reference(),
+         apikey                 :: undefined | binary(),
+         ip                     :: undefined | inet:ip_address(),
+         status = ?DISCONNECTED :: binary(),
+         user                   :: undefined | binary(),
+         pass                   :: undefined | binary()
+        }).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
+handle_command({network, _, _} = Command) ->
+    gen_server:cast(?SERVER, Command);
 handle_command(Command) ->
     gen_server:call(?SERVER, Command).
 
@@ -62,14 +78,15 @@ start(Ip, Apikey) ->
 -spec(init(Args :: term()) ->
              {ok, State :: #state{}} | {ok, State :: #state{}, timeout() | hibernate} |
              {stop, Reason :: term()} | ignore).
-init([IpAddress, Apikey]) ->
+init([IpAddress, ApiKey]) ->
     {ok, Ip} = convert_ip(IpAddress),
-    case connect(Ip, Apikey) of
+    case connect(Ip, ApiKey) of
         {ok, {MRef, ConnPid, StreamRef}} ->
             erlang:send_after(10000, self(), ping),
-            {ok, #state{conn = ConnPid, ref = MRef, stream = StreamRef, apikey = Apikey, ip = Ip}};
-        Error ->
-            {stop, Error}
+            {ok, #state{status = ?NOT_LOGGED_ON, conn = ConnPid, ref = MRef, stream = StreamRef, apikey = ApiKey, ip = Ip}};
+        _Error ->
+            reconnect_msg(),
+            {ok, #state{ip = Ip, apikey = ApiKey}}
     end.
 
 %%--------------------------------------------------------------------
@@ -87,21 +104,38 @@ init([IpAddress, Apikey]) ->
              {noreply, NewState :: #state{}, timeout() | hibernate} |
              {stop, Reason :: term(), Reply :: term(), NewState :: #state{}} |
              {stop, Reason :: term(), NewState :: #state{}}).
+handle_call(_, _From, #state{status = ?DISCONNECTED} = State) ->
+    io:format("You're not connected to the server. Use '/connect IPADDRESS' or '/connect' to connect.~n"),
+    {reply, ok, State};
 handle_call({user, register, {Username, Password}}, _From, #state{conn = Conn} = State) ->
     Msg = [{<<"cmd">>, <<"user_register">>},
            {<<"data">>, [{<<"username">>, Username},
                          {<<"password">>, Password}]}],
     {ok, Packet} = encode(Msg),
     ok = send(Conn, Packet),
-    {reply, ok, State};
+    {reply, ok, State#state{user = Username, pass = Password}};
 handle_call({user, login, {Username, Password}}, _From, #state{conn = Conn} = State) ->
     Msg = [{<<"cmd">>, <<"user_login">>},
            {<<"data">>, [{<<"username">>, Username},
                          {<<"password">>, Password}]}],
     {ok, Packet} = encode(Msg),
     ok = send(Conn, Packet),
-    {reply, ok, State};
-handle_call(_Cmd, _From, #state{status = <<"not_logged_on">>} = State) ->
+    {reply, ok, State#state{user = Username, pass = Password}};
+handle_call({user, logoff, undefined}, _From, #state{conn = Conn,
+                                                     stream = SRef,
+                                                     ref = PRef} = State) ->
+    catch demonitor(SRef),
+    catch demonitor(PRef),
+    catch gun:close(Conn),
+    io:format("Logged off~n"),
+    NState = State#state{user = undefined,
+                         pass = undefined,
+                         conn = undefined,
+                         ref = undefined,
+                         stream = undefined,
+                         status = ?DISCONNECTED},
+    {reply, ok, NState};
+handle_call(_Cmd, _From, #state{status = ?NOT_LOGGED_ON} = State) ->
     %% We put this case here to stop other commands
     %% from being processed if the user is not logged on
     io:format("Error: ~s~n", [<<"You're not logged on. Please login and/or register">>]),
@@ -218,7 +252,67 @@ handle_call(_Request, _From, State) ->
              {noreply, NewState :: #state{}} |
              {noreply, NewState :: #state{}, timeout() | hibernate} |
              {stop, Reason :: term(), NewState :: #state{}}).
+handle_cast({network, connect, undefined}, #state{ip = Ip,
+                                                  apikey = ApiKey,
+                                                  conn = Conn,
+                                                  stream = SRef,
+                                                  ref = PRef} = State) ->
+    catch demonitor(SRef),
+    catch demonitor(PRef),
+    catch gun:close(Conn),
+    case connect(Ip, ApiKey) of
+        {ok, {MRef, ConnPid, StreamRef}} ->
+            erlang:send_after(10000, self(), ping),
+            NState = State#state{status = ?NOT_LOGGED_ON,
+                                 conn = ConnPid,
+                                 ref = MRef,
+                                 stream = StreamRef},
+            gen_server:cast(?SERVER, reauth),
+            {noreply, NState};
+        _Error ->
+            reconnect_msg(),
+            NState = State#state{status = ?DISCONNECTED,
+                                 conn = undefined,
+                                 stream = undefined,
+                                 ref = undefined},
+            {noreply, NState}
+    end;
+handle_cast({network, connect, {_,_,_,_} = NewIp}, #state{apikey = ApiKey,
+                                                          conn = Conn,
+                                                          stream = SRef,
+                                                          ref = PRef} = State) ->
+    catch demonitor(SRef),
+    catch demonitor(PRef),
+    catch gun:close(Conn),
+    case connect(NewIp, ApiKey) of
+        {ok, {MRef, ConnPid, StreamRef}} ->
+            erlang:send_after(10000, self(), ping),
+            NState = State#state{status = ?NOT_LOGGED_ON,
+                                 ip = NewIp,
+                                 conn = ConnPid,
+                                 ref = MRef,
+                                 stream = StreamRef},
+            gen_server:cast(?SERVER, reauth),
+            {noreply, NState};
+        _Error ->
+            reconnect_msg(),
+            NState = State#state{status = ?DISCONNECTED,
+                                 ip = NewIp,
+                                 conn = undefined,
+                                 stream = undefined,
+                                 ref = undefined},
+            {noreply, NState}
+    end;
+handle_cast(reauth, #state{conn = Conn, user = Username, pass = Password} = State)
+  when Username =/= undefined andalso Password =/= undefined ->
+    Msg = [{<<"cmd">>, <<"user_login">>},
+           {<<"data">>, [{<<"username">>, Username},
+                         {<<"password">>, Password}]}],
+    {ok, Packet} = encode(Msg),
+    ok = send(Conn, Packet),
+    {noreply, State};
 handle_cast(_Request, State) ->
+    %% io:format("~p~n", [State]),
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -235,6 +329,8 @@ handle_cast(_Request, State) ->
              {noreply, NewState :: #state{}} |
              {noreply, NewState :: #state{}, timeout() | hibernate} |
              {stop, Reason :: term(), NewState :: #state{}}).
+handle_info(ping, #state{status = ?DISCONNECTED} = State) ->
+    {noreply, State};
 handle_info(ping, #state{conn = Conn} = State) ->
     ok = send(Conn, <<"ping">>),
     {noreply, State};
@@ -267,21 +363,53 @@ handle_info({gun_ws, _ConnPid, _StreamRef, {text, Frame}}, State) ->
                      State#state{status = Status}
              end,
     {noreply, NState};
-handle_info({gun_ws, Pid, SRef, {close,1000,<<>>}}, #state{conn = Pid, stream = SRef, ref = Ref, ip = Ip, apikey = ApiKey} = State) ->
+handle_info({gun_ws, Pid, SRef, {close,1000,<<>>}}, #state{conn = Pid,
+                                                           stream = SRef,
+                                                           ref = Ref,
+                                                           ip = Ip,
+                                                           apikey = ApiKey} = State) ->
     erlang:demonitor(Ref),
     gun:close(Pid),
     case connect(Ip, ApiKey) of
         {ok, {MRef, ConnPid, StreamRef}} ->
-            io:format("Connection went down. Reconnected.~n"),
-            {noreply, State#state{conn = ConnPid, ref = MRef, stream = StreamRef}};
-        Error ->
-            {stop, Error}
+            NState = State#state{status = ?NOT_LOGGED_ON,
+                                 conn = ConnPid,
+                                 ref = MRef,
+                                 stream = StreamRef},
+            ok = gen_server:cast(?SERVER, reauth),
+            {noreply, NState};
+        _Error ->
+            io:format("Failed to reconnect. Try again later with '/connect'.~n"),
+            NState = State#state{status = ?DISCONNECTED,
+                                 conn = undefined,
+                                 ref = undefined,
+                                 stream = undefined},
+            {noreply, NState}
     end;
-handle_info({gun_down, Pid, _Proto, _Reason, _Refs0, _Refs1}, #state{conn = Pid, ref = Ref, ip = Ip, apikey = ApiKey} = State) ->
+handle_info({gun_down, Pid, _Proto, _Reason, _Refs0, _Refs1}, #state{conn = Pid,
+                                                                     ref = Ref,
+                                                                     ip = Ip,
+                                                                     apikey = ApiKey} = State) ->
     io:format("Connection ~p down, reconnecting~n", [Pid]),
     erlang:demonitor(Ref),
-    {ok, {NRef, NPid, NStream}} = connect(Ip, ApiKey),
-    {noreply, State#state{conn = NPid, ref = NRef, stream = NStream}};
+    case connect(Ip, ApiKey) of
+        {ok, {NRef, NPid, NStream}} ->
+            NState = State#state{status = ?NOT_LOGGED_ON,
+                                 conn = NPid,
+                                 ref = NRef,
+                                 stream = NStream},
+            ok = gen_server:cast(?SERVER, reauth),
+            {noreply, NState};
+        _Error ->
+            io:format("Failed to reconnect. Try again later with '/connect'.~n"),
+            {noreply, State#state{status = ?DISCONNECTED,
+                                  conn = undefined,
+                                  ref = undefined,
+                                  stream = undefined}}
+    end;
+handle_info({'DOWN',_Ref, process,_Pid,_Reason}, State) ->
+    %% We're just ignoring this here
+    {noreply, State};
 handle_info(_Info, State) ->
     io:format("Received unmatched message: ~p ~p ~n", [_Info, State]),
     {noreply, State}.
@@ -329,13 +457,13 @@ convert_ip(IpAddress) ->
     end.
 
 connect(Ip, Apikey) ->
-    connect(Ip, Apikey, 10).
+    io:format("connecting to ~p~n", [Ip]),
+    connect(Ip, Apikey, 2).
 
 connect(_Ip, _Apikey, 0) ->
     {error, max_reconnects_exceeded};
 connect(Ip, Apikey, Rem) ->
     Opts = #{retry => 0},
-    io:format("connecting to ~p~n", [Ip]),
     case gun:open(inet_parse:ntoa(Ip), ?SERVER_PORT, Opts) of
         {ok, ConnPid} ->
             case gun:await_up(ConnPid) of
@@ -343,16 +471,21 @@ connect(Ip, Apikey, Rem) ->
                     MRef = monitor(process, ConnPid),
                     %% Now we upgrade to websocket
                     Headers = [{<<"x-apikey">>, Apikey}],
-                    _StreamRef =  gun:ws_upgrade(ConnPid, ?BASE_PATH, Headers, #{compress => true}),
+                    _StreamRef =  gun:ws_upgrade(ConnPid,
+                                                 ?BASE_PATH,
+                                                 Headers,
+                                                 #{compress => true}),
+                    io:format("Connected to ~s~n", [inet_parse:ntoa(Ip)]),
                     confirm_upgrade(MRef, ConnPid);
                 _AwaitError ->
                     gun:close(ConnPid),
-                    timer:sleep(timer:seconds(5)),
+                    io:format("Connection Error: Retrying~n"),
+                    timer:sleep(timer:seconds(1)),
                     connect(Ip, Apikey, Rem - 1)
             end;
         {error, timeout} ->
-            io:format("Connection timeout~n"),
-            timer:sleep(timer:seconds(5)),
+            io:format("Connection Error: timeout, Retrying~n"),
+            timer:sleep(timer:seconds(1)),
             connect(Ip, Apikey, Rem - 1)
     end.
 
@@ -366,7 +499,7 @@ confirm_upgrade(MRef, ConnPid) ->
         Msg ->
             io:format("Unexpected message in socket upgrade [~p] ~p~n", [ConnPid, Msg]),
             gun:close(ConnPid),
-            {error, fucked_conn}
+            {error, broken_upgrade}
     end.
 
 send(Conn, Packet) ->
@@ -376,3 +509,6 @@ encode(Message) ->
     Json = mochijson2:encode(Message),
     BinMsg = iolist_to_binary(Json),
     {ok, BinMsg}.
+
+reconnect_msg() ->
+    io:format("Failed to connect to server. You can try again with '/connect'~n").
